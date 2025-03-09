@@ -46,17 +46,9 @@ class CameraWorker(QThread):
         self.camera_switch_threshold = 0.5
         self.minimum_yaw_diff_to_switch = 50
 
-        # obs connection info
-        self.obs_host = "localhost"
+        # OBS settings
         self.obs_port = 4455
         self.obs_password = ""
-
-        # OBS client
-        self.obs_client = obsws.ReqClient(
-            host=self.obs_host, 
-            port=self.obs_port, 
-            password=self.obs_password
-        )
 
         # DLIB initialization
         self.predictor_path = "shape_predictor_68_face_landmarks.dat"
@@ -572,7 +564,7 @@ class MainWindow(QMainWindow):
         if self.worker.isRunning():
             self.worker.stop()
             self.worker.wait()
-
+        
         # Update worker parameters from GUI
         self.worker.scene_camera_0 = self.edit_scene0.text().strip()
         self.worker.scene_camera_1 = self.edit_scene1.text().strip()
@@ -589,6 +581,11 @@ class MainWindow(QMainWindow):
         self.worker.minimum_yaw_diff_to_switch = self.spin_yawdiff.value()
         self.worker.obs_port = self.spin_port.value()
         self.worker.obs_password = self.edit_password.text()
+        self.obs_client = obsws.ReqClient(
+            host="localhost", 
+            port=self.worker.obs_port, 
+            password=self.worker.obs_password
+        )
 
         self.worker.start()
         self.btn_start.setText("Apply")

@@ -1,0 +1,11 @@
+{
+  "scene_camera_0": "Scene 2",
+  "scene_camera_1": "Scene 3",
+  "poll_interval": 0.1,
+  "camera_switch_threshold": 0.5,
+  "minimum_yaw_diff_to_switch": 60,
+  "obs_port": 4455,
+  "obs_password": "",
+  "camera0_id": 0,
+  "camera1_id": 1
+}
