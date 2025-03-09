@@ -1,20 +1,20 @@
 import sys
 import time
-import subprocess
 import cv2
 import dlib
 import numpy as np
 import json
 import os
 
-from PyQt6.QtCore import Qt, QThread, pyqtSignal, pyqtSlot, QSize
+from PyQt6.QtCore import Qt, QThread, pyqtSignal, pyqtSlot
 from PyQt6.QtGui import QPixmap, QImage
 from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QLabel,
-    QLineEdit, QPushButton, QDoubleSpinBox, QSpinBox, QMessageBox,
-    QGridLayout, QGroupBox, QComboBox, QScrollArea
+    QLineEdit, QPushButton, QDoubleSpinBox, QSpinBox, QGroupBox, QComboBox,
+    QScrollArea
 )
 
+import obsws_python as obsws
 
 ##############################################################################
 # Camera Worker Thread (QThread)
@@ -24,8 +24,8 @@ class CameraWorker(QThread):
     Worker thread that opens two cameras and monitors face yaw.
     Switches scenes in OBS based on user-selected parameters.
     """
-    # Signal to update status in GUI
-    status_update_signal = pyqtSignal(str)
+    # We emit a dictionary with comprehensive status info
+    status_update_signal = pyqtSignal(dict)
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -46,8 +46,17 @@ class CameraWorker(QThread):
         self.camera_switch_threshold = 0.5
         self.minimum_yaw_diff_to_switch = 50
 
-        # obs-cli args
-        self.obs_cli_args = ["obs-cli"]  # Adjust if needed
+        # obs connection info
+        self.obs_host = "localhost"
+        self.obs_port = 4455
+        self.obs_password = ""
+
+        # OBS client
+        self.obs_client = obsws.ReqClient(
+            host=self.obs_host, 
+            port=self.obs_port, 
+            password=self.obs_password
+        )
 
         # DLIB initialization
         self.predictor_path = "shape_predictor_68_face_landmarks.dat"
@@ -58,8 +67,8 @@ class CameraWorker(QThread):
         self.model_points_3D = np.array([
             (0.0,      0.0,       0.0),    # Nose tip
             (0.0,     -330.0,    -65.0),   # Chin
-            (-165.0,   170.0,    -135.0),  # Left corner of left eye
-            (165.0,    170.0,    -135.0),  # Right corner of the right eye
+            (-165.0,   170.0,    -135.0),  # Left eye corner
+            (165.0,    170.0,    -135.0),  # Right eye corner
             (-150.0,  -150.0,    -125.0),  # Left corner of mouth
             (150.0,   -150.0,    -125.0)   # Right corner of mouth
         ], dtype=np.float32)
@@ -69,20 +78,20 @@ class CameraWorker(QThread):
 
         # Variables for scene switching logic
         self.last_facing = None
-        self.camera_facing = None
+        self.obs_facing = None  # Tracks the most recently set OBS scene
         self.yaw_difference = None
         self.camera_switch_counter = 0
         self.camera_switch_counter_threshold = 0
 
-        # We create the captures in run()
+        # Captures
         self.cap0 = None
         self.cap1 = None
 
+        # Store the most recent yaws for each camera
+        self.yaw0 = None
+        self.yaw1 = None
+
     def run(self):
-        """
-        Main loop. Opens the cameras with the selected device IDs
-        and runs until self._running is False.
-        """
         self._running = True
 
         # Convert switch threshold (seconds) to iteration count
@@ -97,24 +106,38 @@ class CameraWorker(QThread):
         if not self.cap0.isOpened() or not self.cap1.isOpened():
             msg = "Error: Could not open one or both cameras."
             print(msg)
-            self.status_update_signal.emit(msg)
+            # Emit a dictionary with partial info so the GUI can update
+            self.status_update_signal.emit({
+                'camera_facing': None,
+                'yaw0': None,
+                'yaw1': None,
+                'yaw_diff': None,
+                'obs_facing': self.obs_facing,
+                'running': self._running,
+                'error': msg
+            })
+            return
 
         while self._running:
-            if not self.cap0 or not self.cap1:
-                time.sleep(1)
-                continue
-
             ret0, frame0 = self.cap0.read()
             ret1, frame1 = self.cap1.read()
 
             if not ret0 or not ret1:
                 err_msg = "Error: Could not read from one or both cameras."
                 print(err_msg)
-                self.status_update_signal.emit(err_msg)
+                self.status_update_signal.emit({
+                    'camera_facing': None,
+                    'yaw0': None,
+                    'yaw1': None,
+                    'yaw_diff': None,
+                    'obs_facing': self.obs_facing,
+                    'running': self._running,
+                    'error': err_msg
+                })
                 time.sleep(1)
                 continue
 
-            # Downsize frames
+            # Downsize frames for faster face detection
             frame0_small = cv2.resize(
                 frame0,
                 (frame0.shape[1] // self.downscale_factor,
@@ -130,24 +153,34 @@ class CameraWorker(QThread):
             result0 = self.estimate_yaw(frame0_small)
             result1 = self.estimate_yaw(frame1_small)
 
-            yaw0 = result0[0] if result0 else None
-            yaw1 = result1[0] if result1 else None
+            self.yaw0 = result0[0] if result0 else None
+            self.yaw1 = result1[0] if result1 else None
 
             # Decide which camera the subject is facing
             camera_facing = None
-            if yaw0 is not None and yaw1 is not None:
-                self.yaw_difference = abs(yaw0 - yaw1)
-                if abs(yaw0) < abs(yaw1):
+            if self.yaw0 is not None and self.yaw1 is not None:
+                self.yaw_difference = abs(self.yaw0 - self.yaw1)
+                # Closer to zero means more "centered" to that camera
+                if abs(self.yaw0) < abs(self.yaw1):
                     camera_facing = "Camera 0"
                 else:
                     camera_facing = "Camera 1"
-            elif yaw0 is not None:
+            elif self.yaw0 is not None:
                 camera_facing = "Camera 0"
-            elif yaw1 is not None:
+                self.yaw_difference = None
+            elif self.yaw1 is not None:
                 camera_facing = "Camera 1"
+                self.yaw_difference = None
+            else:
+                self.yaw_difference = None
 
             # Scene switching logic
-            if camera_facing and camera_facing != self.last_facing and self.yaw_difference and self.yaw_difference >= self.minimum_yaw_diff_to_switch:
+            if (camera_facing and
+                camera_facing != self.last_facing and
+                (self.yaw_difference is None or
+                (self.yaw_difference is not None and
+                self.yaw_difference >= self.minimum_yaw_diff_to_switch))):
+
                 self.camera_switch_counter += 1
                 if self.camera_switch_counter >= self.camera_switch_counter_threshold:
                     self.camera_switch_counter = 0
@@ -156,15 +189,20 @@ class CameraWorker(QThread):
             else:
                 self.camera_switch_counter = 0
 
-            # Update status
-            if camera_facing:
-                status = f"Facing: {camera_facing}, Yaw Diff: {self.yaw_difference}"
-            else:
-                status = "No face or not enough difference"
-            self.status_update_signal.emit(status)
+            # Emit comprehensive status info every loop
+            self.status_update_signal.emit({
+                'camera_facing': camera_facing,
+                'yaw0': self.yaw0,
+                'yaw1': self.yaw1,
+                'yaw_diff': self.yaw_difference,
+                'obs_facing': self.obs_facing,
+                'running': self._running,
+                'error': None
+            })
 
             time.sleep(self.poll_interval)
 
+        # Cleanup
         if self.cap0:
             self.cap0.release()
         if self.cap1:
@@ -178,7 +216,7 @@ class CameraWorker(QThread):
 
     def switch_obs_scene(self, camera_facing):
         """
-        Switch the active OBS scene using obs-cli.
+        Switch the active OBS scene using obsws.
         """
         scene_name = None
         if camera_facing == "Camera 0":
@@ -187,13 +225,12 @@ class CameraWorker(QThread):
             scene_name = self.scene_camera_1
 
         if scene_name:
-            cmd = self.obs_cli_args + ["scene", "switch", scene_name]
             try:
-                subprocess.run(cmd, check=True)
-            except subprocess.CalledProcessError as e:
-                print(f"[ERROR] Failed to switch scene to {scene_name}: {e}")
-            except FileNotFoundError:
-                print("[ERROR] obs-cli not found. Make sure it’s installed and in your PATH.")
+                self.obs_client.set_current_program_scene(scene_name)
+                # Track the most recently set OBS scene
+                self.obs_facing = camera_facing
+            except Exception as e:
+                print(f"[ERROR] {e}")
 
     def estimate_yaw(self, frame_small):
         """
@@ -275,6 +312,7 @@ class MainWindow(QMainWindow):
 
         # Connect signals
         self.worker.status_update_signal.connect(self.on_status_update)
+
         # Automatically detect cameras
         self.detect_cameras()
         self.load_settings()
@@ -294,8 +332,6 @@ class MainWindow(QMainWindow):
         # ==========================
         self.detect_group = QGroupBox("Camera Discovery")
         detect_layout = QVBoxLayout()
-    
-        
 
         # "Refresh / Detect Cameras" button
         self.btn_detect = QPushButton("Refresh / Detect Cameras")
@@ -319,56 +355,99 @@ class MainWindow(QMainWindow):
         # 2) Parameter Group (scene names, etc.)
         # =======================================
         param_group = QGroupBox("Camera & Scene Settings")
-        param_layout = QGridLayout()
+        param_layout = QHBoxLayout()
 
-        # -- Camera 0 row --
-        label_cam0 = QLabel("Camera 0:")
+        # Left column
+        left_layout = QVBoxLayout()
+        label_cam0 = QLabel("Camera 0 Scene:")
         self.edit_scene0 = QLineEdit(self.worker.scene_camera_0)
-        self.combo_cam0_id = QComboBox()
-        # We'll populate the combo box after we detect cameras
-        param_layout.addWidget(label_cam0,        0, 0)
-        param_layout.addWidget(self.edit_scene0,  0, 1)
-        param_layout.addWidget(self.combo_cam0_id,0, 2)
+        left_layout.addWidget(label_cam0)
+        left_layout.addWidget(self.edit_scene0)
 
-        # -- Camera 1 row --
-        label_cam1 = QLabel("Camera 1:")
+        label_cam1 = QLabel("Camera 1 Scene:")
         self.edit_scene1 = QLineEdit(self.worker.scene_camera_1)
-        self.combo_cam1_id = QComboBox()
-        param_layout.addWidget(label_cam1,        1, 0)
-        param_layout.addWidget(self.edit_scene1,  1, 1)
-        param_layout.addWidget(self.combo_cam1_id,1, 2)
+        left_layout.addWidget(label_cam1)
+        left_layout.addWidget(self.edit_scene1)
 
-        # Poll Interval
+        # Right column
+        right_layout = QVBoxLayout()
+
+        # Combos for camera IDs
+        self.combo_cam0_id = QComboBox()
+        label_cam0_id = QLabel("Device ID for Camera 0:")
+        right_layout.addWidget(label_cam0_id)
+        right_layout.addWidget(self.combo_cam0_id)
+
+        self.combo_cam1_id = QComboBox()
+        label_cam1_id = QLabel("Device ID for Camera 1:")
+        right_layout.addWidget(label_cam1_id)
+        right_layout.addWidget(self.combo_cam1_id)
+
+        # Put them together
+        param_layout.addLayout(left_layout)
+        param_layout.addLayout(right_layout)
+        param_group.setLayout(param_layout)
+        main_layout.addWidget(param_group)
+
+        # =================================
+        # 3) Advanced Settings Group
+        # =================================
+        adv_group = QGroupBox("Advanced Settings")
+        adv_layout = QHBoxLayout()
+
+        # Column 1
+        col1 = QVBoxLayout()
         label_poll = QLabel("Poll Interval (s):")
         self.spin_poll = QDoubleSpinBox()
         self.spin_poll.setValue(self.worker.poll_interval)
         self.spin_poll.setRange(0.01, 10.0)
         self.spin_poll.setSingleStep(0.05)
-        param_layout.addWidget(label_poll, 2, 0)
-        param_layout.addWidget(self.spin_poll, 2, 1)
 
-        # Switch threshold
         label_thresh = QLabel("Switch Threshold (s):")
         self.spin_thresh = QDoubleSpinBox()
         self.spin_thresh.setValue(self.worker.camera_switch_threshold)
         self.spin_thresh.setRange(0.0, 10.0)
         self.spin_thresh.setSingleStep(0.5)
-        param_layout.addWidget(label_thresh, 3, 0)
-        param_layout.addWidget(self.spin_thresh, 3, 1)
 
-        # Minimum yaw difference
+        col1.addWidget(label_poll)
+        col1.addWidget(self.spin_poll)
+        col1.addWidget(label_thresh)
+        col1.addWidget(self.spin_thresh)
+
+        # Column 2
+        col2 = QVBoxLayout()
         label_yawdiff = QLabel("Min Yaw Diff (deg):")
         self.spin_yawdiff = QSpinBox()
         self.spin_yawdiff.setValue(self.worker.minimum_yaw_diff_to_switch)
         self.spin_yawdiff.setRange(0, 90)
-        param_layout.addWidget(label_yawdiff, 4, 0)
-        param_layout.addWidget(self.spin_yawdiff, 4, 1)
 
-        param_group.setLayout(param_layout)
-        main_layout.addWidget(param_group)
+        label_port = QLabel("OBS Port:")
+        self.spin_port = QSpinBox()
+        self.spin_port.setValue(self.worker.obs_port)
+        self.spin_port.setRange(1, 65535)
+
+        col2.addWidget(label_yawdiff)
+        col2.addWidget(self.spin_yawdiff)
+        col2.addWidget(label_port)
+        col2.addWidget(self.spin_port)
+
+        # Column 3
+        col3 = QVBoxLayout()
+        label_pass = QLabel("OBS Password:")
+        self.edit_password = QLineEdit(self.worker.obs_password)
+        self.edit_password.setEchoMode(QLineEdit.EchoMode.Password)
+
+        col3.addWidget(label_pass)
+        col3.addWidget(self.edit_password)
+
+        adv_layout.addLayout(col1)
+        adv_layout.addLayout(col2)
+        adv_layout.addLayout(col3)
+        adv_group.setLayout(adv_layout)
+        main_layout.addWidget(adv_group)
 
         # ===================================
-        # 3) Start/Stop Buttons + Status
+        # 4) Start/Stop Buttons
         # ===================================
         button_layout = QHBoxLayout()
         self.btn_start = QPushButton("Start")
@@ -377,17 +456,39 @@ class MainWindow(QMainWindow):
         self.btn_stop.clicked.connect(self.stop_worker)
         button_layout.addWidget(self.btn_start)
         button_layout.addWidget(self.btn_stop)
-
-        self.status_label = QLabel("Status: Idle")
-
         main_layout.addLayout(button_layout)
-        main_layout.addWidget(self.status_label)
 
+        # ===================================
+        # 5) Status Info Labels
+        # ===================================
+        self.status_group = QGroupBox("Status")
+        status_layout = QVBoxLayout()
+
+        # We'll create labels for each line of info
+        self.lbl_status_runstop = QLabel("Status: Stopped")
+        self.lbl_facing_current = QLabel("Current Facing: None")
+        self.lbl_facing_obs = QLabel("Current OBS Facing: None")
+        self.lbl_yaw_cam1 = QLabel("Camera 1 Yaw: N/A")
+        self.lbl_yaw_cam2 = QLabel("Camera 2 Yaw: N/A")
+        self.lbl_yaw_offset = QLabel("Yaw Offset: N/A")
+        self.lbl_error = QLabel("")  # Only show if needed
+
+        # Add to layout
+        status_layout.addWidget(self.lbl_status_runstop)
+        status_layout.addWidget(self.lbl_facing_current)
+        status_layout.addWidget(self.lbl_facing_obs)
+        status_layout.addWidget(self.lbl_yaw_cam1)
+        status_layout.addWidget(self.lbl_yaw_cam2)
+        status_layout.addWidget(self.lbl_yaw_offset)
+        status_layout.addWidget(self.lbl_error)
+
+        self.status_group.setLayout(status_layout)
+        main_layout.addWidget(self.status_group)
 
     @pyqtSlot()
     def detect_cameras(self):
         """
-        Attempt to open camera IDs 0..10, capture a single frame,
+        Attempt to open camera IDs sequentially, capture a single frame,
         and display them in a preview panel. Also fill the camera
         combo boxes with the IDs that worked.
         """
@@ -402,32 +503,29 @@ class MainWindow(QMainWindow):
         self.combo_cam0_id.clear()
         self.combo_cam1_id.clear()
 
-        # We define a range of potential devices to test
         found_devices = []
         device_id = 0
         while True:
             cap = cv2.VideoCapture(device_id)
             if cap.isOpened():
-                time.sleep(0.2)  # Let the camera warm up
+                time.sleep(0.2)
                 ret, frame = cap.read()
                 if ret:
                     found_devices.append(device_id)
-                    # Convert this frame to a QPixmap for preview
+                    # Create a preview
                     preview_label = self.create_preview_label(frame, device_id)
                     self.preview_layout.addWidget(preview_label)
-                    self.detect_group.setFixedHeight(min(2,len(found_devices)) * 180)
                 cap.release()
+                device_id += 1
             else:
+                cap.release()
                 break
-            device_id += 1
 
         if found_devices:
-            # Fill combo boxes with found devices
             for dev_id in found_devices:
                 self.combo_cam0_id.addItem(str(dev_id), dev_id)
                 self.combo_cam1_id.addItem(str(dev_id), dev_id)
         else:
-            # No devices found
             no_cam_label = QLabel("No cameras found.")
             self.preview_layout.addWidget(no_cam_label)
 
@@ -436,7 +534,6 @@ class MainWindow(QMainWindow):
         Convert an OpenCV frame to a QPixmap and embed in a QLabel
         with some text describing the device ID.
         """
-        # Convert BGR to RGB
         frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
 
         # Optionally resize the preview
@@ -451,11 +548,9 @@ class MainWindow(QMainWindow):
             frame_rgb = cv2.resize(frame_rgb, (new_w, new_h))
             h, w, _ = frame_rgb.shape
 
-        # Convert to QImage
         qimg = QImage(frame_rgb.data, w, h, 3 * w, QImage.Format.Format_RGB888)
         pixmap = QPixmap.fromImage(qimg)
 
-        # Create a label that shows the device ID + pixmap
         container = QWidget()
         layout = QHBoxLayout(container)
 
@@ -477,49 +572,26 @@ class MainWindow(QMainWindow):
         if self.worker.isRunning():
             self.worker.stop()
             self.worker.wait()
-            # Update worker parameters from GUI
-            self.worker.scene_camera_0 = self.edit_scene0.text().strip()
-            self.worker.scene_camera_1 = self.edit_scene1.text().strip()
 
-            # Use the "data" from selected item if available
-            idx0 = self.combo_cam0_id.currentIndex()
-            idx1 = self.combo_cam1_id.currentIndex()
+        # Update worker parameters from GUI
+        self.worker.scene_camera_0 = self.edit_scene0.text().strip()
+        self.worker.scene_camera_1 = self.edit_scene1.text().strip()
 
-            # If there's at least one item in combo, read it, else default
-            if idx0 >= 0:
-                self.worker.camera0_id = self.combo_cam0_id.itemData(idx0)
-            if idx1 >= 0:
-                self.worker.camera1_id = self.combo_cam1_id.itemData(idx1)
+        idx0 = self.combo_cam0_id.currentIndex()
+        idx1 = self.combo_cam1_id.currentIndex()
+        if idx0 >= 0:
+            self.worker.camera0_id = self.combo_cam0_id.itemData(idx0)
+        if idx1 >= 0:
+            self.worker.camera1_id = self.combo_cam1_id.itemData(idx1)
 
-            self.worker.poll_interval = self.spin_poll.value()
-            self.worker.camera_switch_threshold = self.spin_thresh.value()
-            self.worker.minimum_yaw_diff_to_switch = self.spin_yawdiff.value()
+        self.worker.poll_interval = self.spin_poll.value()
+        self.worker.camera_switch_threshold = self.spin_thresh.value()
+        self.worker.minimum_yaw_diff_to_switch = self.spin_yawdiff.value()
+        self.worker.obs_port = self.spin_port.value()
+        self.worker.obs_password = self.edit_password.text()
 
-            self.worker.start()
-            self.btn_start.setText("Apply")
-            self.status_label.setText("Status: Re-started...")
-        else:
-            # Update worker parameters from GUI
-            self.worker.scene_camera_0 = self.edit_scene0.text().strip()
-            self.worker.scene_camera_1 = self.edit_scene1.text().strip()
-
-            # Use the "data" from selected item if available
-            idx0 = self.combo_cam0_id.currentIndex()
-            idx1 = self.combo_cam1_id.currentIndex()
-
-            # If there's at least one item in combo, read it, else default
-            if idx0 >= 0:
-                self.worker.camera0_id = self.combo_cam0_id.itemData(idx0)
-            if idx1 >= 0:
-                self.worker.camera1_id = self.combo_cam1_id.itemData(idx1)
-
-            self.worker.poll_interval = self.spin_poll.value()
-            self.worker.camera_switch_threshold = self.spin_thresh.value()
-            self.worker.minimum_yaw_diff_to_switch = self.spin_yawdiff.value()
-
-            self.worker.start()
-            self.btn_start.setText("Apply")
-            self.status_label.setText("Status: Running...")
+        self.worker.start()
+        self.btn_start.setText("Apply")
         self.save_settings()
 
     @pyqtSlot()
@@ -530,19 +602,71 @@ class MainWindow(QMainWindow):
         if self.worker.isRunning():
             self.worker.stop()
             self.worker.wait()
-            self.status_label.setText("Status: Stopped")
         self.btn_start.setText("Start")
 
-    @pyqtSlot(str)
-    def on_status_update(self, msg):
+        # Update the label to show Stopped
+        self.lbl_status_runstop.setText("Status: Stopped")
+
+    @pyqtSlot(dict)
+    def on_status_update(self, data):
         """
-        Called whenever the worker emits a status update signal.
+        Handle comprehensive status info.
+        Update our dedicated status labels accordingly.
         """
-        self.status_label.setText(f"Status: {msg}")
+        is_running = data['running']
+        camera_facing = data.get('camera_facing', None)
+        obs_facing = data.get('obs_facing', None)
+        yaw0 = data.get('yaw0', None)
+        yaw1 = data.get('yaw1', None)
+        yaw_diff = data.get('yaw_diff', None)
+        err_msg = data.get('error', "")
+
+        # 1) Running/Stopped
+        if is_running:
+            self.lbl_status_runstop.setText("Status: Running")
+        else:
+            self.lbl_status_runstop.setText("Status: Stopped")
+
+        # 2) Current Facing
+        if camera_facing is None:
+            self.lbl_facing_current.setText("Current Facing: No face detected")
+        else:
+            self.lbl_facing_current.setText(f"Current Facing: {camera_facing}")
+
+        # 3) Current OBS Facing
+        if obs_facing is None:
+            self.lbl_facing_obs.setText("Current OBS Facing: None")
+        else:
+            self.lbl_facing_obs.setText(f"Current OBS Facing: {obs_facing}")
+
+        # 4) Camera 1 Yaw
+        #    Recall that in your earlier code, "Camera 1" is camera0 internally.
+        if yaw0 is not None:
+            self.lbl_yaw_cam1.setText(f"Camera 1 Yaw: {yaw0:.2f} Degrees")
+        else:
+            self.lbl_yaw_cam1.setText("Camera 1 Yaw: N/A")
+
+        # 5) Camera 2 Yaw (camera1 in code)
+        if yaw1 is not None:
+            self.lbl_yaw_cam2.setText(f"Camera 2 Yaw: {yaw1:.2f} Degrees")
+        else:
+            self.lbl_yaw_cam2.setText("Camera 2 Yaw: N/A")
+
+        # 6) Yaw Offset
+        if yaw_diff is not None:
+            self.lbl_yaw_offset.setText(f"Yaw Offset: {yaw_diff:.2f} Degrees")
+        else:
+            self.lbl_yaw_offset.setText("Yaw Offset: N/A")
+
+        # 7) Error message (if any)
+        if err_msg:
+            self.lbl_error.setText(f"Error: {err_msg}")
+        else:
+            self.lbl_error.setText("")
 
     def closeEvent(self, event):
         """
-        If the user closes the window, ensure the worker is stopped.
+        On close, ensure the worker is stopped, and save settings.
         """
         if self.worker.isRunning():
             self.worker.stop()
@@ -551,7 +675,7 @@ class MainWindow(QMainWindow):
         event.accept()
 
     def load_settings(self):
-        """Load settings from settings.json if available."""
+        """Load settings from a JSON file if available."""
         if os.path.exists("settings.json"):
             with open("settings.json", "r") as f:
                 data = json.load(f)
@@ -560,6 +684,9 @@ class MainWindow(QMainWindow):
             self.spin_poll.setValue(data.get("poll_interval", self.worker.poll_interval))
             self.spin_thresh.setValue(data.get("camera_switch_threshold", self.worker.camera_switch_threshold))
             self.spin_yawdiff.setValue(data.get("minimum_yaw_diff_to_switch", self.worker.minimum_yaw_diff_to_switch))
+            self.spin_port.setValue(data.get("obs_port", self.worker.obs_port))
+            self.edit_password.setText(data.get("obs_password", self.worker.obs_password))
+
             cam0_id = data.get("camera0_id", self.worker.camera0_id)
             cam1_id = data.get("camera1_id", self.worker.camera1_id)
             idx0 = self.combo_cam0_id.findData(cam0_id)
@@ -573,13 +700,15 @@ class MainWindow(QMainWindow):
             self.combo_cam1_id.setCurrentIndex(idx1 if idx1 >= 0 else 0)
 
     def save_settings(self):
-        """Save current settings to settings.json."""
+        """Save current settings to a JSON file."""
         data = {
             "scene_camera_0": self.edit_scene0.text().strip(),
             "scene_camera_1": self.edit_scene1.text().strip(),
             "poll_interval": self.spin_poll.value(),
             "camera_switch_threshold": self.spin_thresh.value(),
             "minimum_yaw_diff_to_switch": self.spin_yawdiff.value(),
+            "obs_port": self.spin_port.value(),
+            "obs_password": self.edit_password.text(),
             "camera0_id": self.combo_cam0_id.itemData(self.combo_cam0_id.currentIndex()),
             "camera1_id": self.combo_cam1_id.itemData(self.combo_cam1_id.currentIndex())
         }

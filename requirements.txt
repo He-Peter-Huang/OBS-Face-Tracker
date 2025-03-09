@@ -1,4 +1,4 @@
 PyQt6
 dlib
 opencv-python
-obs-cli                                                                                                                                        ✔  at 12:40:53 AM  
+obsws_python
