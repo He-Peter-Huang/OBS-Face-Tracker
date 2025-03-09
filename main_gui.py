@@ -581,7 +581,7 @@ class MainWindow(QMainWindow):
         self.worker.minimum_yaw_diff_to_switch = self.spin_yawdiff.value()
         self.worker.obs_port = self.spin_port.value()
         self.worker.obs_password = self.edit_password.text()
-        self.obs_client = obsws.ReqClient(
+        self.worker.obs_client = obsws.ReqClient(
             host="localhost", 
             port=self.worker.obs_port, 
             password=self.worker.obs_password
